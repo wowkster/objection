@@ -1,0 +1,9 @@
+[http]
+host = "0.0.0.0"
+port = 2048
+
+[cors]
+allow-origins = ["https://cdn.example.com", "http://cdn.example.com"]
+allow-methods = ["HEAD", "GET", "OPTIONS", "DELETE"]
+allow-headers = ["Authorization", "Accept", "Cache-Control"]
+allow-credentials = true
