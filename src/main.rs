@@ -1,49 +1,21 @@
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-};
+use std::collections::BTreeSet;
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 
-use axum::{
-    extract::{FromRef, Request},
-    http::{HeaderValue, StatusCode, Uri},
-    Json, Router, ServiceExt,
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
+use objection::{
+    config::{CachePolicy, Config, CorsConfig, HttpConfig, TlsConfig, TlsKeyConfig, TlsVersion},
+    create_server,
 };
-use clap::Parser;
-use config::Config;
-use serde_json::{json, Value};
-use tower_http::{cors::CorsLayer, normalize_path::NormalizePath, trace::TraceLayer};
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
-
-use crate::routes::create_router;
-
-mod config;
-// mod error;
-// mod extractors;
-// mod headers;
-// mod middleware;
-mod models;
-mod routes;
+use url::Url;
 
 #[derive(Debug, clap::Parser)]
 pub struct Args {
     config_path: Option<PathBuf>,
 }
-
-type Database = Arc<sqlite::ConnectionThreadSafe>;
-
-#[derive(Clone)]
-struct AppState {
-    database: Database,
-}
-
-impl FromRef<AppState> for Database {
-    fn from_ref(app_state: &AppState) -> Database {
-        app_state.database.clone()
-    }
-}
-
-static CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -55,89 +27,272 @@ async fn main() -> std::io::Result<()> {
 
     let args = Args::parse();
 
-    let config = CONFIG.get_or_init(|| {
-        args.config_path
-            .map(Config::parse_and_validate)
-            .unwrap_or_default()
-    });
+    let config = args.config_path.map(parse_and_validate).unwrap_or_default();
 
     tracing::debug!("using config: {:#?}", config);
 
-    /* Initialize State */
+    let (_, handle) = create_server(config).await;
 
-    init_data_directory().expect("Failed to create data directory");
+    tokio::select! {
+        r = handle => r.expect("failed to serve"),
+        _ =  tokio::signal::ctrl_c() => {}
+    }
 
-    let database = init_db().await.expect("Failed to initialize DB");
+    Ok(())
+}
 
-    let state = AppState { database };
+pub fn parse_and_validate(path: impl AsRef<Path>) -> Config {
+    use clap::error::ErrorKind;
 
-    /* CORS Support */
+    let mut cmd = Args::command();
 
-    let cors = match &config.cors {
-        Some(cors) => {
-            let origins = cors
-                .allow_origins
-                .iter()
-                .map(|o| o.ascii_serialization().parse().unwrap())
-                .collect::<Vec<HeaderValue>>();
-
-            CorsLayer::new()
-                .allow_methods(cors.allow_methods.clone().into_iter().collect::<Vec<_>>())
-                .allow_headers(cors.allow_headers.clone().into_iter().collect::<Vec<_>>())
-                .allow_credentials(cors.allow_credentials)
-                .allow_origin(origins)
-        }
-        None => CorsLayer::new(),
+    let contents = match std::fs::read_to_string(path.as_ref()) {
+        Ok(value) => value,
+        Err(e) => cmd
+            .error(
+                ErrorKind::Io,
+                format!(
+                    "Failed to read configuration file '{}': {}",
+                    path.as_ref().display(),
+                    e
+                ),
+            )
+            .exit(),
+    };
+    let file = match toml::from_str::<ConfigFile>(&contents) {
+        Ok(value) => value,
+        Err(e) => cmd
+            .error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "Failed to parse configuration file '{}': {}",
+                    path.as_ref().display(),
+                    e
+                ),
+            )
+            .exit(),
     };
 
-    /* Initialize Application */
-
-    let app = NormalizePath::trim_trailing_slash(
-        Router::new()
-            .fallback(fallback)
-            .merge(create_router(state.clone()))
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state),
-    );
-
-    /* Serve our app with hyper */
-
-    let addr = SocketAddr::from((config.http.host, config.http.port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    tracing::info!("Listening on: http://{}", addr);
-
-    axum::serve(
-        listener,
-        ServiceExt::<Request>::into_make_service_with_connect_info::<SocketAddr>(app),
-    )
-    .await
+    validate_file(file)
 }
 
-fn init_data_directory() -> std::io::Result<()> {
-    std::fs::create_dir_all("data")
+fn validate_file(file: ConfigFile) -> Config {
+    let mut cmd = Args::command();
+
+    let data_directory =
+        Path::new(&file.data_directory.expect("missing data directory")).to_path_buf();
+
+    let http = file
+        .http
+        .map(|http| HttpConfig {
+            host: http.host.unwrap_or_else(|| HttpConfig::default().host),
+            port: http.port.unwrap_or_else(|| HttpConfig::default().port),
+        })
+        .unwrap_or_default();
+
+    let tls = file.tls.map(|tls| {
+            let tls_versions = match tls.tls_versions {
+                Some(versions) => versions
+                    .into_iter()
+                    .map(|v| {
+                        v.parse::<TlsVersion>().unwrap_or_else(|_| {
+                            cmd.error(
+                                ErrorKind::ValueValidation,
+                                format!("Invalid TLS version '{}'", v),
+                            )
+                            .exit()
+                        })
+                    })
+                    .collect(),
+                None => BTreeSet::from([TlsVersion::V1_1, TlsVersion::V1_2, TlsVersion::V1_3]),
+            };
+
+            let keys = match (
+                tls.private_key,
+                tls.public_key,
+                tls.private_key_file,
+                tls.public_key_file,
+            ) {
+                (None, None, Some(private_key_file), Some(public_key_file)) =>
+                    TlsKeyConfig::File { private_key_file, public_key_file },
+                (Some(private_key), Some(public_key), None, None) =>
+                    TlsKeyConfig::String { private_key, public_key },
+                _ => cmd
+                    .error(
+                        ErrorKind::ValueValidation,
+                        "Invalid TLS configuration. Must specify either 'private-key' and 'public-key' or 'private-key-file' and 'public-key-file'",
+                    )
+                    .exit(),
+            };
+
+            TlsConfig {
+                tls_versions,
+                keys,
+            }
+        });
+
+    let cors = file.cors.map(|cors| CorsConfig {
+        allow_origins: cors
+            .allow_origins
+            .map(|origins| {
+                origins
+                    .into_iter()
+                    .map(|o| {
+                        o.parse::<Url>()
+                            .unwrap_or_else(|_| {
+                                cmd.error(
+                                    ErrorKind::ValueValidation,
+                                    format!("Invalid CORS origin '{}'", o),
+                                )
+                                .exit()
+                            })
+                            .origin()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allow_methods: cors
+            .allow_methods
+            .map(|methods| {
+                methods
+                    .into_iter()
+                    .map(|m| {
+                        m.parse().unwrap_or_else(|_| {
+                            cmd.error(
+                                ErrorKind::ValueValidation,
+                                format!("Invalid CORS HTTP method '{}'", m),
+                            )
+                            .exit()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allow_headers: cors
+            .allow_headers
+            .map(|headers| {
+                headers
+                    .into_iter()
+                    .map(|h| {
+                        h.parse().unwrap_or_else(|_| {
+                            cmd.error(
+                                ErrorKind::ValueValidation,
+                                format!("Invalid CORS HTTP header '{}'", h),
+                            )
+                            .exit()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        allow_credentials: cors.allow_credentials.unwrap_or_default(),
+    });
+
+    let cache_control = file
+        .cache_control
+        .map(|_| todo!("Validate cache control config"))
+        .unwrap_or_default();
+    let access_control = file
+        .access_control
+        .map(|_| todo!("Validate access control config"))
+        .unwrap_or_default();
+    let ip_filter = file
+        .ip_filter
+        .map(|_| todo!("Validate ip filter config"))
+        .unwrap_or_default();
+    let content_types = file
+        .content_types
+        .map(|_| todo!("Validate content type filter config"))
+        .unwrap_or_default();
+    let rate_limiting = file
+        .rate_limiting
+        .map(|_| todo!("Validate rate limiting config"))
+        .unwrap_or_default();
+
+    Config {
+        data_directory,
+        http,
+        tls,
+        cors,
+        cache_control,
+        access_control,
+        ip_filter,
+        content_types,
+        rate_limiting,
+    }
 }
 
-async fn init_db() -> sqlite::Result<Database> {
-    let db = Arc::new(sqlite::Connection::open_thread_safe(
-        Path::new("data").join("database.sqlite3"),
-    )?);
-
-    models::create_tables(&db).await?;
-
-    tracing::debug!("Initialized database!");
-
-    Ok(db)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConfigFile {
+    data_directory: Option<String>,
+    http: Option<PartialHttpConfig>,
+    tls: Option<PartialTlsConfig>,
+    cors: Option<PartialCorsConfig>,
+    cache_control: Option<PartialCacheControlConfig>,
+    access_control: Option<PartialAccessControlConfig>,
+    ip_filter: Option<PartialIpFilterConfig>,
+    content_types: Option<PartialContentTypesConfig>,
+    rate_limiting: Option<PartialRateLimitingConfig>,
 }
 
-/// Generic 404 fallback handler
-async fn fallback(uri: Uri) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": "NOT_FOUND",
-            "message": format!("The requested resource `{}` was not found", uri)
-        })),
-    )
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialHttpConfig {
+    host: Option<Ipv4Addr>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialTlsConfig {
+    tls_versions: Option<BTreeSet<String>>,
+    private_key: Option<String>,
+    public_key: Option<String>,
+    private_key_file: Option<PathBuf>,
+    public_key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialCorsConfig {
+    allow_origins: Option<BTreeSet<String>>,
+    allow_methods: Option<BTreeSet<String>>,
+    allow_headers: Option<BTreeSet<String>>,
+    allow_credentials: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialCacheControlConfig {
+    default_policy: Option<CachePolicy>,
+    default_max_age: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialAccessControlConfig {
+    enable_access_tokens: Option<bool>,
+    enable_local_host_auth_bypass: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialIpFilterConfig {
+    whitelist: Option<BTreeSet<String>>,
+    blacklist: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialContentTypesConfig {
+    whitelist: Option<BTreeSet<String>>,
+    blacklist: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartialRateLimitingConfig {
+    default_period: Option<String>,
+    default_burst_size: Option<u32>,
 }

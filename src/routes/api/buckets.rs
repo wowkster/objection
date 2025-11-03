@@ -1,19 +1,19 @@
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 
 use crate::{
+    AppState,
     models::bucket::{Bucket, BucketSettings},
-    AppState, Database,
 };
 
 pub fn create_buckets_router() -> Router<AppState> {
     Router::new()
         .route("/", get(get_buckets).post(post_buckets))
         .route(
-            "/:name",
+            "/{name}",
             get(get_bucket).patch(patch_bucket).delete(delete_bucket),
         )
-        .route("/:name/objects", get(get_objects).post(handler))
+    // .route("/:name/objects", get(get_objects).post(handler))
 }
 
 #[derive(Debug, Serialize)]
@@ -33,7 +33,7 @@ impl From<Bucket> for ClientBucket {
     }
 }
 
-async fn get_buckets(State(db): State<Database>) -> Json<Vec<ClientBucket>> {
+async fn get_buckets(State(db): State<sqlx::SqlitePool>) -> Json<Vec<ClientBucket>> {
     Json(
         Bucket::find_all(&db)
             .await
